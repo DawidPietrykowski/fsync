@@ -1,0 +1,11 @@
+services:
+  fsync:
+    image: fsync
+    container_name: fsync
+    environment:
+      BIND_ADDR: "0.0.0.0:80"
+      FILE_DIR: "/app/data"
+    volumes:
+      - ./fsync-data:/app/data
+    ports:
+      - '9999:80'

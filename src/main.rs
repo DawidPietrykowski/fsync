@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_FILE_DIR: &str = "data";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9876";
+const DEFAULT_CONNECT_ADDR: &str = "127.0.0.1:9876";
 
 struct HttpHeader {
     name: String,
@@ -234,7 +235,6 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
                     .fold(Vec::<u8>::new(), |mut acc: Vec<u8>, n: PathBuf| {
                         let relative_path = n.strip_prefix(file_dir).unwrap();
                         let mut bytes = relative_path.to_str().unwrap().as_bytes().to_vec();
-                        println!("returning: {:?}", bytes);
                         acc.append(&mut bytes);
                         acc.push('\n' as u8);
                         acc
@@ -297,7 +297,6 @@ enum Mode {
 fn send_http_request(addr: &str, request: HttpRequest) -> HttpResponse {
     let mut socket = TcpStream::connect(addr).unwrap();
     let sent = socket.write(&request.encode()).unwrap();
-    println!("sent {} bytes", sent);
     socket.flush().unwrap();
     HttpResponse::from_stream(&mut socket)
 }
@@ -316,6 +315,7 @@ fn main() {
     let file_directory_path =
         path.unwrap_or(env::var("FILE_DIR").unwrap_or(DEFAULT_FILE_DIR.to_owned()));
     let bind_addr = env::var("BIND_ADDR").unwrap_or(DEFAULT_BIND_ADDR.to_owned());
+    let connect_addr = &env::var("CONNECT_ADDR").unwrap_or(DEFAULT_CONNECT_ADDR.to_owned());
 
     match mode {
         Mode::Server => {
@@ -335,10 +335,8 @@ fn main() {
                 headers: vec![],
                 data: vec![],
             };
-            let addr = "127.0.0.1:9876";
-            let response = send_http_request(addr, list_request);
+            let response = send_http_request(connect_addr, list_request);
             let mut files: Vec<String> = vec![];
-            println!("bytes: {:?}", response.data.clone());
             let mut data_iter = response.data.iter();
             loop {
                 let line_bytes: Vec<u8> = (&mut data_iter)
@@ -359,7 +357,7 @@ fn main() {
                     headers: vec![],
                     data: vec![],
                 };
-                let response = send_http_request(addr, contents_request);
+                let response = send_http_request(connect_addr, contents_request);
                 let file_path = PathBuf::from(&file_directory_path).join(file);
                 fs::write(&file_path, response.data).unwrap();
                 println!("Written file: {:?}", file_path);
@@ -380,7 +378,7 @@ fn main() {
                         headers: vec![],
                         data,
                     };
-                    let response = send_http_request(addr, contents_request);
+                    let response = send_http_request(connect_addr, contents_request);
                     assert_eq!(response.code, HttpCode::Ok);
                     println!("File update successfull");
                 }
