@@ -1,9 +1,11 @@
 use std::time::Duration;
-use std::{env, fs, thread};
+use std::{env, fs, io, thread};
 
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+
+use native_tls::TlsConnector;
 
 const DEFAULT_FILE_DIR: &str = "data";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9876";
@@ -12,6 +14,15 @@ const DEFAULT_CONNECT_ADDR: &str = "127.0.0.1:9876";
 struct HttpHeader {
     name: String,
     data: String,
+}
+
+impl HttpHeader {
+    fn new(name: &str, data: &str) -> HttpHeader {
+        HttpHeader {
+            name: name.to_owned(),
+            data: data.to_owned(),
+        }
+    }
 }
 
 struct HttpRequest {
@@ -30,11 +41,16 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
-    pub fn from_stream(stream: &mut TcpStream) -> HttpResponse {
+    pub fn from_stream<S>(stream: &mut S) -> HttpResponse
+    where
+        S: io::Read + io::Write,
+    {
         let mut http_buffer = [0; 1024];
         let received = stream.read(&mut http_buffer).unwrap();
-        let request = str::from_utf8(&http_buffer[0..received]).unwrap();
-        let mut lines = request.lines();
+        let response = str::from_utf8(&http_buffer[0..received]).unwrap();
+        // println!("Received response: \n{}", response);
+
+        let mut lines = response.lines();
         let first_line = lines.next().unwrap();
         let mut request_elements = first_line.split_whitespace();
         let protocol = request_elements.next().unwrap().to_string();
@@ -90,6 +106,7 @@ impl HttpResponse {
 enum HttpCode {
     NotFound,
     Ok,
+    Unauthorized,
 }
 
 impl HttpCode {
@@ -97,10 +114,12 @@ impl HttpCode {
         let code = match self {
             HttpCode::NotFound => 404,
             HttpCode::Ok => 200,
+            HttpCode::Unauthorized => 400,
         };
         let string = match self {
             HttpCode::NotFound => "Not found",
             HttpCode::Ok => "Ok",
+            HttpCode::Unauthorized => "Unauthorized",
         };
         format!("{} {}", code, string)
     }
@@ -111,7 +130,8 @@ impl From<u32> for HttpCode {
         match value {
             200 => HttpCode::Ok,
             404 => HttpCode::NotFound,
-            _ => unimplemented!(),
+            400 => HttpCode::Unauthorized,
+            _ => HttpCode::NotFound,
         }
     }
 }
@@ -149,7 +169,10 @@ impl From<&str> for RequestType {
 }
 
 impl HttpRequest {
-    pub fn from_stream(stream: &mut TcpStream) -> HttpRequest {
+    pub fn from_stream<S>(stream: &mut S) -> HttpRequest
+    where
+        S: io::Read + io::Write,
+    {
         let mut http_buffer = [0; 1024];
         let received = stream.read(&mut http_buffer).unwrap();
         let request = str::from_utf8(&http_buffer[0..received]).unwrap();
@@ -294,11 +317,25 @@ enum Mode {
     Client,
 }
 
-fn send_http_request(addr: &str, request: HttpRequest) -> HttpResponse {
+fn send_http_request(addr: &str, mut request: HttpRequest) -> HttpResponse {
+    request.headers.push(HttpHeader::new("Connection", "close"));
+    request.headers.push(HttpHeader::new("Host", addr));
+
+    let https = addr.chars().any(|c| c.is_ascii_alphabetic());
+
     let mut socket = TcpStream::connect(addr).unwrap();
-    let sent = socket.write(&request.encode()).unwrap();
-    socket.flush().unwrap();
-    HttpResponse::from_stream(&mut socket)
+    if https {
+        let connector = TlsConnector::new().unwrap();
+        let host = addr.split(':').next().unwrap();
+        let mut stream = connector.connect(host, socket).unwrap();
+        stream.write(&request.encode()).unwrap();
+        stream.flush().unwrap();
+        HttpResponse::from_stream(&mut stream)
+    } else {
+        socket.write(&request.encode()).unwrap();
+        socket.flush().unwrap();
+        HttpResponse::from_stream(&mut socket)
+    }
 }
 
 fn main() {
@@ -329,13 +366,14 @@ fn main() {
         }
         Mode::Client => {
             let list_request = HttpRequest {
-                protocol: "HTTP/1.1".to_owned(),
+                protocol: "HTTP/1.0".to_owned(),
                 path: "/".to_owned(),
                 request_type: RequestType::Get,
                 headers: vec![],
                 data: vec![],
             };
             let response = send_http_request(connect_addr, list_request);
+            assert_eq!(response.code, HttpCode::Ok);
             let mut files: Vec<String> = vec![];
             let mut data_iter = response.data.iter();
             loop {
@@ -346,18 +384,21 @@ fn main() {
                 if line_bytes.is_empty() {
                     break;
                 }
-                files.push(String::from_utf8(line_bytes).unwrap());
+                let filename = String::from_utf8(line_bytes).unwrap();
+                println!("Found file: {}", filename);
+                files.push(filename);
             }
             for file in &files {
                 println!("Downloading file: {}", file);
                 let contents_request = HttpRequest {
-                    protocol: "HTTP/1.1".to_owned(),
+                    protocol: "HTTP/1.0".to_owned(),
                     path: "/".to_owned() + &file,
                     request_type: RequestType::Get,
                     headers: vec![],
                     data: vec![],
                 };
                 let response = send_http_request(connect_addr, contents_request);
+                assert_eq!(response.code, HttpCode::Ok);
                 let file_path = PathBuf::from(&file_directory_path).join(file);
                 fs::write(&file_path, response.data).unwrap();
                 println!("Written file: {:?}", file_path);
@@ -372,7 +413,7 @@ fn main() {
                     let file_path = PathBuf::from(&file_directory_path).join(file);
                     let data = fs::read(&file_path).unwrap();
                     let contents_request = HttpRequest {
-                        protocol: "HTTP/1.1".to_owned(),
+                        protocol: "HTTP/1.0".to_owned(),
                         path: "/".to_owned() + &file,
                         request_type: RequestType::Post,
                         headers: vec![],
