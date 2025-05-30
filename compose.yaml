@@ -1,6 +1,6 @@
 services:
   fsync:
-    image: fsync
+    image: hotspaghetti/fsync
     container_name: fsync
     environment:
       BIND_ADDR: "0.0.0.0:80"
