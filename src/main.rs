@@ -84,7 +84,12 @@ impl<T: Encodable> HttpMessage<T> {
         let mut res = vec![];
         res.append(&mut self.message_data.encode_first_line(&self.protocol).clone());
         res.extend_from_slice(&CRLF);
-        for header in self.headers {
+        let mut headers = self.headers.clone();
+        headers.push(HttpHeader {
+            name: "Content-Length".to_string(),
+            data: format!("{}", self.data.len()),
+        });
+        for header in headers {
             res.append(&mut header.to_string().into_bytes());
             res.extend_from_slice(&CRLF);
         }
@@ -336,18 +341,14 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
             }
         }
         RequestType::Post => {
-            println!(
-                "Received POST request for file: {}",
-                request.message_data.path
-            );
+            println!("Received POST request for file: {:?}", file_path);
 
             let mut headers = vec![];
             headers.push(HttpHeader::new("Connection", "close"));
             headers.push(HttpHeader::new("Access-Control-Allow-Origin", "*"));
 
-            let response = if request.message_data.path.contains('/')
-                || fs::write(file_path, request.data).is_err()
-            {
+            let response = if request.message_data.path.contains('/') {
+                println!("File containts `/`, returning 404");
                 HttpResponse {
                     protocol: request.protocol,
                     message_data: ResponseData {
@@ -357,6 +358,8 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
                     data: vec![],
                 }
             } else {
+                fs::write(&file_path, request.data).unwrap();
+                println!("File written: {:?}", file_path);
                 HttpResponse {
                     protocol: request.protocol,
                     message_data: ResponseData { code: HttpCode::Ok },
