@@ -1,5 +1,3 @@
-#![feature(pattern)]
-
 use std::time::Duration;
 use std::{env, fs, io, thread};
 
@@ -13,7 +11,9 @@ const DEFAULT_FILE_DIR: &str = "data";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9876";
 const DEFAULT_CONNECT_ADDR: &str = "127.0.0.1:9876";
 const BUFFER_LEN: usize = 1024;
-const CRLF: [u8; 4] = *b"\r\n\r\n";
+const CRLF: [u8; 2] = *b"\r\n";
+const CRLF_CRLF: [u8; 4] = *b"\r\n\r\n";
+const HTTP_PROTOCOL: &str = "HTTP/1.0";
 
 #[derive(Clone, Debug)]
 struct HttpHeader {
@@ -35,19 +35,63 @@ impl HttpHeader {
 }
 
 #[derive(Clone)]
-struct HttpRequest {
+struct HttpMessage<T> {
     protocol: String,
-    path: String,
-    request_type: RequestType,
     headers: Vec<HttpHeader>,
     data: Vec<u8>,
+    message_data: T,
 }
 
-struct HttpResponse {
-    protocol: String,
+#[derive(Clone)]
+struct RequestData {
+    path: String,
+    request_type: RequestType,
+}
+
+#[derive(Clone)]
+struct ResponseData {
     code: HttpCode,
-    headers: Vec<HttpHeader>,
-    data: Vec<u8>,
+}
+
+type HttpRequest = HttpMessage<RequestData>;
+type HttpResponse = HttpMessage<ResponseData>;
+
+trait Encodable {
+    fn encode_first_line(&self, protocol: &str) -> Vec<u8>;
+}
+
+impl Encodable for RequestData {
+    fn encode_first_line(&self, protocol: &str) -> Vec<u8> {
+        let line = format!(
+            "{} {} {}",
+            self.request_type.to_string(),
+            self.path,
+            protocol
+        );
+        line.as_bytes().to_vec()
+    }
+}
+
+impl Encodable for ResponseData {
+    fn encode_first_line(&self, protocol: &str) -> Vec<u8> {
+        let line = format!("{} {}", protocol, self.code.to_string(),);
+        line.as_bytes().to_vec()
+    }
+}
+
+impl<T: Encodable> HttpMessage<T> {
+    fn encode(self) -> Vec<u8> {
+        let mut res = vec![];
+        res.append(&mut self.message_data.encode_first_line(&self.protocol).clone());
+        res.extend_from_slice(&CRLF);
+        for header in self.headers {
+            res.append(&mut header.to_string().into_bytes());
+            res.extend_from_slice(&CRLF);
+        }
+        res.extend_from_slice(&CRLF);
+        res.append(&mut self.data.clone());
+        res
+    }
 }
 
 impl HttpResponse {
@@ -64,33 +108,16 @@ impl HttpResponse {
             protocol,
             headers,
             data,
-            code,
+            message_data: ResponseData { code },
         }
-    }
-    pub fn encode(self) -> Vec<u8> {
-        let mut res = vec![];
-        res.append(&mut self.protocol.into_bytes());
-        res.push(' ' as u8);
-        res.append(&mut self.code.to_string().into_bytes());
-        res.push(' ' as u8);
-        res.append(&mut self.code.to_string().into_bytes());
-        res.extend_from_slice(&CRLF);
-        for header in self.headers {
-            res.append(&mut header.to_string().into_bytes());
-            res.extend_from_slice(&CRLF);
-        }
-        res.push('\r' as u8);
-        res.push('\n' as u8);
-        res.append(&mut self.data.clone());
-        res
     }
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 enum HttpCode {
-    NotFound,
-    Ok,
-    Unauthorized,
+    Ok = 200,
+    Unauthorized = 400,
+    NotFound = 404,
 }
 
 impl HttpCode {
@@ -126,10 +153,11 @@ impl From<&str> for HttpCode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum RequestType {
     Get,
     Post,
+    Delete,
     Unknown,
 }
 
@@ -138,7 +166,8 @@ impl RequestType {
         match self {
             RequestType::Get => "GET".to_owned(),
             RequestType::Post => "POST".to_owned(),
-            RequestType::Unknown => panic!(),
+            RequestType::Unknown => "DELETE".to_owned(),
+            RequestType::Delete => todo!(),
         }
     }
 }
@@ -148,6 +177,7 @@ impl From<&str> for RequestType {
         match value {
             "GET" => RequestType::Get,
             "POST" => RequestType::Post,
+            "DELETE" => RequestType::Delete,
             _ => RequestType::Unknown,
         }
     }
@@ -210,13 +240,11 @@ where
             let tmp_received = stream.read(&mut tmp_buf).unwrap();
             body_data.extend_from_slice(&tmp_buf[0..tmp_received]);
             received += tmp_received;
-            let header_end_pos = http_buffer.windows(4).position(|w| w == CRLF);
+            let header_end_pos = http_buffer.windows(4).position(|w| w == CRLF_CRLF);
             if header_end_pos.is_some() {
                 break;
             }
         }
-    } else {
-        // println!("No content length header");
     }
     (first_line.to_string(), headers, body_data)
 }
@@ -229,44 +257,19 @@ impl HttpRequest {
         let (request_line, headers, data) = decode_http_packet(&mut stream);
         let mut request_elements = request_line.split_whitespace();
         let request_type = RequestType::from(request_elements.next().unwrap());
-        let path = request_elements
-            .next()
-            .unwrap()
+        let path_string = request_elements.next().unwrap();
+        let path = path_string
             .strip_prefix("/")
-            .unwrap()
+            .unwrap_or(path_string)
             .to_string();
         let protocol = request_elements.next().unwrap().to_string();
 
         HttpRequest {
             protocol,
-            path,
-            request_type,
             headers,
             data,
+            message_data: RequestData { path, request_type },
         }
-    }
-
-    fn encode(self) -> Vec<u8> {
-        let mut response = self.clone();
-        let data_length = response.data.len();
-        response.headers.push(HttpHeader {
-            name: "Content-Length".to_owned(),
-            data: data_length.to_string(),
-        });
-        let mut res = vec![];
-        res.append(&mut response.request_type.to_string().into_bytes());
-        res.push(' ' as u8);
-        res.append(&mut response.path.to_string().into_bytes());
-        res.push(' ' as u8);
-        res.append(&mut response.protocol.into_bytes());
-        res.extend_from_slice(&CRLF);
-        for header in response.headers {
-            res.append(&mut header.to_string().into_bytes());
-            res.extend_from_slice(&CRLF);
-        }
-        res.extend_from_slice(&CRLF);
-        res.append(&mut response.data.clone());
-        res
     }
 }
 
@@ -274,11 +277,11 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
     let request = HttpRequest::from_stream(&mut stream);
 
     let file_dir = Path::new(&file_directory_path);
-    let file_path = file_dir.join(Path::new(&request.path));
+    let file_path = file_dir.join(Path::new(&request.message_data.path));
 
-    match request.request_type {
+    match request.message_data.request_type {
         RequestType::Get => {
-            if request.path.is_empty() {
+            if request.message_data.path.is_empty() {
                 println!("Received request for file list");
                 // list all files
                 let data = fs::read_dir(file_dir)
@@ -296,20 +299,23 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
                     });
                 let response = HttpResponse {
                     protocol: request.protocol,
-                    code: HttpCode::Ok,
                     headers: vec![HttpHeader {
                         name: "Content-Type".to_string(),
                         data: "text/plain".to_string(),
                     }],
                     data,
+                    message_data: ResponseData { code: HttpCode::Ok },
                 };
                 stream.write_all(&response.encode()).unwrap();
             } else {
-                println!("Received GET request for file: {}", request.path);
+                println!(
+                    "Received GET request for file: {}",
+                    request.message_data.path
+                );
                 let response = if let Ok(file_contents) = fs::read(file_path) {
                     HttpResponse {
                         protocol: request.protocol,
-                        code: HttpCode::Ok,
+                        message_data: ResponseData { code: HttpCode::Ok },
                         headers: vec![HttpHeader {
                             name: "Content-Type".to_string(),
                             data: "text/plain".to_string(),
@@ -319,7 +325,9 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
                 } else {
                     HttpResponse {
                         protocol: request.protocol,
-                        code: HttpCode::NotFound,
+                        message_data: ResponseData {
+                            code: HttpCode::NotFound,
+                        },
                         headers: vec![],
                         data: vec![],
                     }
@@ -328,18 +336,66 @@ fn handle_client(mut stream: TcpStream, file_directory_path: String) {
             }
         }
         RequestType::Post => {
-            println!("Received POST request for file: {}", request.path);
-            println!("POST data: {:?}", request.data);
-            fs::write(file_path, request.data).unwrap();
+            println!(
+                "Received POST request for file: {}",
+                request.message_data.path
+            );
+
             let mut headers = vec![];
             headers.push(HttpHeader::new("Connection", "close"));
             headers.push(HttpHeader::new("Access-Control-Allow-Origin", "*"));
-            let response = HttpResponse {
-                protocol: request.protocol,
-                code: HttpCode::Ok,
-                headers,
-                data: vec![],
+
+            let response = if request.message_data.path.contains('/')
+                || fs::write(file_path, request.data).is_err()
+            {
+                HttpResponse {
+                    protocol: request.protocol,
+                    message_data: ResponseData {
+                        code: HttpCode::NotFound,
+                    },
+                    headers,
+                    data: vec![],
+                }
+            } else {
+                HttpResponse {
+                    protocol: request.protocol,
+                    message_data: ResponseData { code: HttpCode::Ok },
+                    headers,
+                    data: vec![],
+                }
             };
+
+            stream.write_all(&response.encode()).unwrap();
+        }
+        RequestType::Delete => {
+            println!(
+                "Received DELETE request for file: {}",
+                request.message_data.path
+            );
+
+            let mut headers = vec![];
+            headers.push(HttpHeader::new("Connection", "close"));
+            headers.push(HttpHeader::new("Access-Control-Allow-Origin", "*"));
+
+            let response =
+                if request.message_data.path.contains('/') || fs::remove_file(file_path).is_err() {
+                    HttpResponse {
+                        protocol: request.protocol,
+                        message_data: ResponseData {
+                            code: HttpCode::NotFound,
+                        },
+                        headers,
+                        data: vec![],
+                    }
+                } else {
+                    HttpResponse {
+                        protocol: request.protocol,
+                        message_data: ResponseData { code: HttpCode::Ok },
+                        headers,
+                        data: vec![],
+                    }
+                };
+
             stream.write_all(&response.encode()).unwrap();
         }
         _ => {}
@@ -398,14 +454,16 @@ fn main() {
         }
         Mode::Client => {
             let list_request = HttpRequest {
-                protocol: "HTTP/1.0".to_owned(),
-                path: "/".to_owned(),
-                request_type: RequestType::Get,
+                protocol: HTTP_PROTOCOL.to_owned(),
                 headers: vec![],
                 data: vec![],
+                message_data: RequestData {
+                    path: "/".to_owned(),
+                    request_type: RequestType::Get,
+                },
             };
             let response = send_http_request(connect_addr, list_request);
-            assert_eq!(response.code, HttpCode::Ok);
+            assert_eq!(response.message_data.code, HttpCode::Ok);
             let mut files: Vec<String> = vec![];
             let mut data_iter = response.data.iter();
             loop {
@@ -423,36 +481,56 @@ fn main() {
             for file in &files {
                 println!("Downloading file: {}", file);
                 let contents_request = HttpRequest {
-                    protocol: "HTTP/1.0".to_owned(),
-                    path: "/".to_owned() + &file,
-                    request_type: RequestType::Get,
+                    protocol: HTTP_PROTOCOL.to_owned(),
+                    message_data: RequestData {
+                        path: format!("/{}", file),
+                        request_type: RequestType::Get,
+                    },
                     headers: vec![],
                     data: vec![],
                 };
                 let response = send_http_request(connect_addr, contents_request);
-                assert_eq!(response.code, HttpCode::Ok);
+                assert_eq!(response.message_data.code, HttpCode::Ok);
                 let file_path = PathBuf::from(&file_directory_path).join(file);
+                println!("Writing to file: {:?}", file_path);
                 fs::write(&file_path, response.data).unwrap();
-                println!("Written file: {:?}", file_path);
             }
+
+            let local_files: Vec<PathBuf> = fs::read_dir(&file_directory_path)
+                .unwrap()
+                .filter_map(|f| {
+                    if let Ok(file) = f {
+                        let path = file.path();
+                        if path.is_file() { Some(path) } else { None }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             // sync indefinietly
             loop {
                 thread::sleep(Duration::from_secs(1));
                 println!("Syncing files to server");
-                for file in &files {
-                    let file_path = PathBuf::from(&file_directory_path).join(file);
-                    let data = fs::read(&file_path).unwrap();
-                    println!("Sending file to server: {} - {:?}", file, data);
+                for file in &local_files {
+                    let data = fs::read(&file).unwrap();
+                    let file_str = file
+                        .strip_prefix(&file_directory_path)
+                        .unwrap()
+                        .to_str()
+                        .unwrap();
+                    println!("Sending file to server: {}", file_str);
                     let contents_request = HttpRequest {
-                        protocol: "HTTP/1.0".to_owned(),
-                        path: "/".to_owned() + &file,
-                        request_type: RequestType::Post,
+                        protocol: HTTP_PROTOCOL.to_owned(),
                         headers: vec![],
                         data,
+                        message_data: RequestData {
+                            path: format!("/{}", file_str),
+                            request_type: RequestType::Post,
+                        },
                     };
                     let response = send_http_request(connect_addr, contents_request);
-                    assert_eq!(response.code, HttpCode::Ok);
+                    assert_eq!(response.message_data.code, HttpCode::Ok);
                     println!("File update successfull");
                 }
             }
