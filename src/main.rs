@@ -1,11 +1,127 @@
+use std::os::raw::{c_int, c_uint, c_void};
 use std::time::Duration;
-use std::{env, fs, io, thread};
+use std::{env, fs, io, ptr, thread};
 
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 use native_tls::TlsConnector;
+
+#[allow(unused)]
+mod constants {
+    pub const ALG_SET_KEY: u32 = 1;
+    pub const ALG_SET_IV: u32 = 2;
+    pub const ALG_SET_OP: u32 = 3;
+    pub const ALG_SET_AEAD_ASSOCLEN: u32 = 4;
+    pub const ALG_SET_AEAD_AUTHSIZE: u32 = 5;
+    pub const ALG_SET_DRBG_ENTROPY: u32 = 6;
+    pub const ALG_SET_KEY_BY_KEY_SERIAL: u32 = 7;
+    pub const ALG_OP_DECRYPT: u32 = 0;
+    pub const ALG_OP_ENCRYPT: u32 = 1;
+    pub const SOCK_SEQPACKET: u32 = 5;
+    pub const AES_KEY_LEN: u32 = 16;
+    pub const AF_ALG: u16 = 38;
+    pub const SOL_ALG: u32 = 279;
+    pub const SHA256_DIG_LEN: usize = 32;
+}
+
+use crate::constants::*;
+
+#[allow(unused)]
+unsafe extern "C" {
+    fn socket(domain: c_int, type_: c_int, protocol: c_int) -> c_int;
+    fn bind(sockfd: c_int, addr: *const sockaddr_alg, addrlen: c_uint) -> c_int;
+    fn setsockopt(
+        fd: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *const c_void,
+        optlen: c_uint,
+    ) -> c_int;
+    fn accept(fd: c_int, addr: *const sockaddr_alg, addrlen: *const c_uint) -> c_int;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> c_int;
+    fn read(fd: c_int, buf: *const c_void, count: usize) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn __errno_location() -> *mut c_int;
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct sockaddr_alg {
+    salg_family: u16,
+    salg_type: [u8; 14],
+    salg_feat: u32,
+    salg_mask: u32,
+    salg_name: [u8; 64],
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types, unused)]
+struct af_alg_iv {
+    ivlen: u32,
+    iv: [u8],
+}
+
+fn print_err() {
+    let errno = unsafe { *__errno_location() };
+    if errno == 0 {
+        return;
+    }
+    println!("{}", std::io::Error::from_raw_os_error(errno));
+}
+
+fn run_op() {
+    let mut salg_type = [0u8; 14];
+    let hash = b"hash";
+    salg_type[..hash.len()].copy_from_slice(hash);
+    let mut salg_name = [0u8; 64];
+    let sha1 = b"sha256";
+    salg_name[..sha1.len()].copy_from_slice(sha1);
+    let sa = sockaddr_alg {
+        salg_family: AF_ALG,
+        salg_type,
+        salg_feat: 0,
+        salg_mask: 0,
+        salg_name,
+    };
+
+    unsafe {
+        let socket_fd = socket(AF_ALG as c_int, SOCK_SEQPACKET as c_int, 0);
+        print_err();
+        assert_ne!(socket_fd, 0);
+        println!("socket fd: {}", socket_fd);
+        // let key = [1u8; AES_KEY_LEN as usize];
+        // let err = setsockopt(
+        //     socket_fd,
+        //     SOL_ALG as c_int,
+        //     ALG_SET_KEY as c_int,
+        //     key.as_ptr().cast(),
+        //     key.len() as c_uint,
+        // );
+        let sockaddr_ptr: *const sockaddr_alg = &sa;
+        let err = bind(socket_fd, sockaddr_ptr, size_of::<sockaddr_alg>() as u32);
+        assert_eq!(err, 0);
+        print_err();
+
+        let size = 0;
+        let accept_fd = accept(socket_fd, ptr::null(), &size);
+        print_err();
+
+        let data = b"text\n";
+        let write_len = write(accept_fd, data.as_ptr().cast(), data.len());
+        print_err();
+        assert_eq!(write_len, data.len() as c_int);
+        let result = [0u8; SHA256_DIG_LEN];
+        let read_len = read(accept_fd, result.as_ptr().cast(), result.len());
+        print_err();
+        result.iter().for_each(|b| print!("{:x?}", b));
+        assert_eq!(read_len, SHA256_DIG_LEN as c_int);
+
+        close(accept_fd);
+        close(socket_fd);
+    }
+}
 
 const DEFAULT_FILE_DIR: &str = "data";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:9876";
@@ -430,6 +546,8 @@ fn send_http_request(addr: &str, mut request: HttpRequest) -> HttpResponse {
 }
 
 fn main() {
+    run_op();
+    return;
     // get cli arguments
     let mut args_iter = env::args().skip(1);
     let mode = args_iter.next().map_or(Mode::Server, |m| match m.as_str() {
